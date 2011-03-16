@@ -84,12 +84,6 @@ typedef struct download_list {
     struct download_list *next;
 } download_list_t;
 
-//Structure to encapsulate multiple arguments into one 
-//(pthreads only accept one argument. This is how we get around that restriction)
-typedef struct d_thread_arg { 
-    task_t* download_task;
-    task_t* tracker_task;
-} d_thread_arg_t;
 
 
 // task_new(type)
@@ -717,9 +711,16 @@ static void task_upload(task_t *t)
 	task_free(t);
 }
 
+// A thread representing some download request will execute here
 void* process_downloads(void *arg) {
     download_list_t *download_entry = (download_list_t *) arg;
     task_download(download_entry->download,download_entry->tracker);
+    pthread_exit(NULL);
+}
+
+// A thread representing some upload request will execute here
+void* process_uploads(void *arg) {
+    task_upload( (task_t *)arg );
     pthread_exit(NULL);
 }
 
@@ -728,14 +729,13 @@ void* process_downloads(void *arg) {
 //	The main loop!
 int main(int argc, char *argv[])
 {
-	task_t *tracker_task, *listen_task;
+	task_t *tracker_task, *listen_task, *t;
 	struct in_addr tracker_addr;
 	int tracker_port;
 	char *s;
 	const char *myalias;
 	struct passwd *pwent;
-        download_list_t *list = NULL;
-        pthread_t d_thread;
+        download_list_t *d_list = NULL;
 
 	// Default tracker is read.cs.ucla.edu
 	osp2p_sscanf("131.179.80.139:11111", "%I:%d",
@@ -807,52 +807,54 @@ int main(int argc, char *argv[])
 	// First, download files named on command line.
 
         // Create a list of download tasks
-        download_list_t *current;
+        download_list_t *current_d;
 
 	for (; argc > 1; argc--, argv++) {
-            if(!list) {
-                list = (download_list_t *) malloc(sizeof(download_list_t));
-                list->download = start_download(tracker_task,argv[1]);
-                list->tracker = tracker_task;
-                list->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
-                list->next = NULL;
-                current = list;
+            if(!d_list) {
+                d_list = (download_list_t *) malloc(sizeof(download_list_t));
+                d_list->download = start_download(tracker_task,argv[1]);
+                d_list->tracker = tracker_task;
+                d_list->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                d_list->next = NULL;
+                current_d = d_list;
             } else {
-                assert(!current->next);
-                current->next = (download_list_t *) malloc(sizeof(download_list_t));
-                current = current->next;
-                current->download = start_download(tracker_task,argv[1]);
-                current->tracker = tracker_task;
-                current->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
-                current->next = NULL;
+                assert(!current_d->next);
+                current_d->next = (download_list_t *) malloc(sizeof(download_list_t));
+                current_d = current_d->next;
+                current_d->download = start_download(tracker_task,argv[1]);
+                current_d->tracker = tracker_task;
+                current_d->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                current_d->next = NULL;
             }
         }
 
         // Now launch each download in its own thread
-        current = list;
+        current_d = d_list;
 
-        while(current != NULL) {
-            pthread_create( current->d_thread, NULL, process_downloads, (void*) current );
-            current = current->next;
+        while(current_d != NULL) {
+            pthread_create( current_d->d_thread, NULL, process_downloads, (void*) current_d );
+            current_d = current_d->next;
         }
 
         // Block main thread until all downloads have completed
-        current = list;
+        current_d = d_list;
         download_list_t *ptr;
        
-        while(current != NULL) {
-            pthread_join(*current->d_thread, NULL);
-            ptr = current;
-            current = current->next;
+        while(current_d != NULL) {
+            pthread_join(*current_d->d_thread, NULL);
+            ptr = current_d;
+            current_d = current_d->next;
             free(ptr->d_thread);
             free(ptr);
         }
 
-        //FIX: WE NEED TO FREE EVERYTHING WE MALLOCED!!!
-         
 	// Then accept connections from other peers and upload files to them!
-	//while ((t = task_listen(listen_task)))
-	//	task_upload(t);
+
+        //Generate a new thread for each upload request
+	while ((t = task_listen(listen_task))) {
+            pthread_t u_thread;
+            pthread_create( &u_thread, NULL, process_uploads, (void*) t );
+        } 
 
 	return 0;
 }
