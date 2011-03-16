@@ -20,6 +20,7 @@
 #include <pwd.h>
 #include <time.h>
 #include <limits.h>
+#include <pthread.h>
 #include "md5.h"
 #include "osp2p.h"
 
@@ -27,6 +28,7 @@ int evil_mode;			// nonzero iff this peer should behave badly
 
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
+pthread_mutex_t tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 /*****************************************************************************
@@ -73,6 +75,21 @@ typedef struct task {
 				// task_pop_peer() removes peers from it, one
 				// at a time, if a peer misbehaves.
 } task_t;
+
+
+typedef struct download_list {
+    task_t *download;       // Download request
+    task_t *tracker;        // Tracker task
+    pthread_t *d_thread;    // Pointer to thread obj to be associated with this request
+    struct download_list *next;
+} download_list_t;
+
+//Structure to encapsulate multiple arguments into one 
+//(pthreads only accept one argument. This is how we get around that restriction)
+typedef struct d_thread_arg { 
+    task_t* download_task;
+    task_t* tracker_task;
+} d_thread_arg_t;
 
 
 // task_new(type)
@@ -157,6 +174,9 @@ typedef enum taskbufresult {		// Status of a read or write attempt.
 //	whichever comes first.  Return values are TBUF_ constants, above;
 //	generally a return value of TBUF_AGAIN means 'try again later'.
 //	The task buffer is capped at TASKBUFSIZ.
+
+
+//Filling up the task buffer w/ fd's contents
 taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 {
 	unsigned headpos = (t->head % TASKBUFSIZ);
@@ -164,7 +184,7 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 	ssize_t amt;
 
 	if (t->head == t->tail || headpos < tailpos)
-		amt = read(fd, &t->buf[tailpos], TASKBUFSIZ - tailpos);
+		amt = read(fd, &t->buf[tailpos], TASKBUFSIZ - tailpos);  
 	else
 		amt = read(fd, &t->buf[tailpos], headpos - tailpos);
 
@@ -179,6 +199,11 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		t->tail += amt;
 		return TBUF_OK;
 	}
+
+        //FIX: bug here? what if tail wraps around? this just keeps increasing tail
+        //If too big, data will wrap around and overwrite data!!! probably more of a
+        //problem in caller than this actual function.
+
 }
 
 
@@ -282,6 +307,10 @@ int open_socket(struct in_addr addr, int port)
 //	finds a terminator line.  It returns the number of characters in the
 //	data portion.  It also terminates this client if the tracker's response
 //	is formatted badly.  (This code trusts the tracker.)
+
+//FIX: this is a security vulnerability. A bad tracker can screw this system over
+//with a badly formatted response
+//FIX: if t->tail is too large, we will have buffer overflow!!!!we should check for this case
 static size_t read_tracker_response(task_t *t)
 {
 	char *s;
@@ -298,12 +327,12 @@ static size_t read_tracker_response(task_t *t)
 				if (split_pos == (size_t) -1)
 					split_pos = pos;
 				if (pos + 4 >= t->tail)
-					break;
+					break; //Need to read more input
 				if (isspace((unsigned char) t->buf[pos + 3])
 				    && t->buf[t->tail - 1] == '\n') {
 					t->buf[t->tail] = '\0';
 					return split_pos;
-				}
+				} 
 			}
 
 		// If not, read more data.  Note that the read will not block
@@ -426,7 +455,7 @@ static void register_files(task_t *tracker_task, const char *myalias)
 		if (tracker_task->buf[messagepos] != '2')
 			error("* Tracker error message while registering '%s':\n%s",
 			      ent->d_name, &tracker_task->buf[messagepos]);
-	}
+	}   //FIX: Current code doesn't check whether registration even worked. need to check?
 
 	closedir(dir);
 }
@@ -577,11 +606,20 @@ static void task_download(task_t *t, task_t *tracker_task)
 			t->disk_filename, (unsigned long) t->total_written);
 		// Inform the tracker that we now have the file,
 		// and can serve it to others!  (But ignore tracker errors.)
+                //FIX: tracker errors are ignored. Probably not a good idea!
+
+                //Acquire mutex in order to write into tracker's buffer
+                pthread_mutex_lock(&tracker_mutex);
+
 		if (strcmp(t->filename, t->disk_filename) == 0) {
 			osp2p_writef(tracker_task->peer_fd, "HAVE %s\n",
 				     t->filename);
 			(void) read_tracker_response(tracker_task);
 		}
+      
+                //Release the mutex
+                pthread_mutex_unlock(&tracker_mutex);
+
 		task_free(t);
 		return;
 	}
@@ -662,7 +700,7 @@ static void task_upload(task_t *t)
 		if (ret == TBUF_ERROR) {
 			error("* Peer write error");
 			goto exit;
-		}
+		}  //FIX: why does it write before doing any read? should we zero out the buffer?
 
 		ret = read_to_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -679,17 +717,25 @@ static void task_upload(task_t *t)
 	task_free(t);
 }
 
+void* process_downloads(void *arg) {
+    download_list_t *download_entry = (download_list_t *) arg;
+    task_download(download_entry->download,download_entry->tracker);
+    pthread_exit(NULL);
+}
+
 
 // main(argc, argv)
 //	The main loop!
 int main(int argc, char *argv[])
 {
-	task_t *tracker_task, *listen_task, *t;
+	task_t *tracker_task, *listen_task;
 	struct in_addr tracker_addr;
 	int tracker_port;
 	char *s;
 	const char *myalias;
 	struct passwd *pwent;
+        download_list_t *list = NULL;
+        pthread_t d_thread;
 
 	// Default tracker is read.cs.ucla.edu
 	osp2p_sscanf("131.179.80.139:11111", "%I:%d",
@@ -759,13 +805,54 @@ int main(int argc, char *argv[])
 	register_files(tracker_task, myalias);
 
 	// First, download files named on command line.
-	for (; argc > 1; argc--, argv++)
-		if ((t = start_download(tracker_task, argv[1])))
-			task_download(t, tracker_task);
 
+        // Create a list of download tasks
+        download_list_t *current;
+
+	for (; argc > 1; argc--, argv++) {
+            if(!list) {
+                list = (download_list_t *) malloc(sizeof(download_list_t));
+                list->download = start_download(tracker_task,argv[1]);
+                list->tracker = tracker_task;
+                list->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                list->next = NULL;
+                current = list;
+            } else {
+                assert(!current->next);
+                current->next = (download_list_t *) malloc(sizeof(download_list_t));
+                current = current->next;
+                current->download = start_download(tracker_task,argv[1]);
+                current->tracker = tracker_task;
+                current->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                current->next = NULL;
+            }
+        }
+
+        // Now launch each download in its own thread
+        current = list;
+
+        while(current != NULL) {
+            pthread_create( current->d_thread, NULL, process_downloads, (void*) current );
+            current = current->next;
+        }
+
+        // Block main thread until all downloads have completed
+        current = list;
+        download_list_t *ptr;
+       
+        while(current != NULL) {
+            pthread_join(*current->d_thread, NULL);
+            ptr = current;
+            current = current->next;
+            free(ptr->d_thread);
+            free(ptr);
+        }
+
+        //FIX: WE NEED TO FREE EVERYTHING WE MALLOCED!!!
+         
 	// Then accept connections from other peers and upload files to them!
-	while ((t = task_listen(listen_task)))
-		task_upload(t);
+	//while ((t = task_listen(listen_task)))
+	//	task_upload(t);
 
 	return 0;
 }
