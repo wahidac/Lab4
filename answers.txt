@@ -13,23 +13,51 @@
 # information you'd like us to know, please add it at the end of the file.
 
 # Partner 1
-Name: 
-Student ID: 
-Email: 
+Name: Alvin Huynh
+Student ID: 503678533
+Email: ahuynh5190@ucla.edu
 
 # Partner 2 (if you're working in a team)
-Name: 
-Student ID: 
-Email: 
+Name: Wahid Chowdhury
+Student ID: 103673844
+Email: wahidac@gmail.com
 
 # EXERCISE 1: What method you used to make your peer download and upload
 #    files in parallel?  (~1-3 sentences)
 
-# EXERCISE 2A: What conditions did you find and fix that would have
-#    triggered a buffer overrun bug?  (~1-3 sentences each)
+To make our peer download and upload files in parallel, we used pthreads to
+allow for our peer to handle multiple connections at once.  With each thread
+handling a connection, our peer can both download and upload files in parallel.
+
+# EXERCISE 2A: What conditions did you find and fix that would have triggered a
+# buffer overrun bug?  (~1-3 sentences each)
+
+One condition we fixed involved a buffer overrun of the filename buffer.  If a
+peer used a "GET file OSP2P" request, where the filename is larger than our
+fixed capacity of FILENAMESIZ, then it was possible for the peer to cause our
+peer to overrun our buffer.  In order to fix this, we checked the filename size
+and only accepted filename lengths less than our equal to what we have capacity
+for, before reading the filename into our buffer.
 
 # EXERCISE 2B: What other robustness problems did you fix?  (~1-3 sentences
 #    each)
+
+We fixed a robustness problem involving a peer serving files outside the
+current directory.  To fix this, we added a check before opening the actual
+file to see if it was a path or not by checking for an existence of a "/" in
+the filename. As a result, the peer only serves files inside the current directory
+specified by the option.  
+
+Another robustness problem we fixed involved potentially running out of memory
+or disk space.  To address this, we set a fixed download size limit.  If our
+peer downloads a file passed this limit, then we stop downloading and try again
+from anothe peer.
+
+Another robustness problem that was fixed involved running out file descriptors
+when they weren't actually being used.  We set a timeout for our connections so
+that we can potentially avoid denial of service attacks that just connect to
+our peer, but don't actually do anything useful. 
+
 
 # EXERCISE 3: Describe the attacks you implemented for "evil mode".  Why
 #    are they attacks?  (~3-10 sentences each)
