@@ -25,7 +25,7 @@
 #include "osp2p.h"
 
 int evil_mode;			// nonzero iff this peer should behave badly
-int num_open_upload_connections = 0; //How many peers are connected to us?
+unsigned int num_open_upload_connections = 0; //How many peers are connected to us?
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
 
@@ -42,7 +42,7 @@ pthread_cond_t  condition_var = PTHREAD_COND_INITIALIZER;
 
 #define TASKBUFSIZ	10000 	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
-#define MAXCONNECTIONS   0
+#define MAXCONNECTIONS   20
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
