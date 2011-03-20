@@ -644,25 +644,58 @@ static void task_upload(task_t *t)
 
 	assert(t->head == 0);
 
- 	// In order to ensure that peers don't serve files outside the current directory,
+	// We need to isolate the filename string to check if the size
+        // is greater than what we have capacity for.  This will allow
+        // us to prevent a buffer overflow attack.
+
+        char *temp_buf = t->buf;
+        int filename_start = 0;
+
+        // This while loop figures out where the start of the filename string
+        // begins.
+        while(1) {
+                if(!temp_buf)
+                        break;
+                else if(*temp_buf == ' ') {
+                        filename_start++;
+                        break;
+                }
+                else {
+                        filename_start++;
+                        temp_buf++;
+                }
+        }
+
+        // Check the length of the file name passed.
+
+        if(t->tail - filename_start > FILENAMESIZ) {
+                error("* Buffer overflow prevented.\n");
+                goto exit;
+        }
+
+	if(osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
+                error("* Odd request %.*s\n", t->tail, t->buf);
+                goto exit;
+        }
+
+        // In order to ensure that peers don't serve files outside the current directory,
         // we will exit if the filename happens to be a path and not an actual filename.
-
+        
         char *file = t->filename;
-        while(*file) {
-
+        while(1) {
                 // Check to see if the current character pointed to by file is 
                 // is a slash or not.  
-                if(*file == '/') {
+        
+                if(!file)
+                        break;
+                else if(*file == '/') {
                         error("* Avoided security attack by not switching to dir: %s \n", t->filename);
                         goto exit;
                 }
-                file++;
+                else
+                        file++;
         }
 
-	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
-		error("* Odd request %.*s\n", t->tail, t->buf);
-		goto exit;
-	}
 	t->head = t->tail = 0;
 
 	t->disk_fd = open(t->filename, O_RDONLY);
