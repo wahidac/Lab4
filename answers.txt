@@ -36,7 +36,7 @@ One condition we fixed involved a buffer overrun of the filename buffer.  If a
 peer used a "GET file OSP2P" request, where the filename is larger than our
 fixed capacity of FILENAMESIZ, then it was possible for the peer to cause our
 peer to overrun our buffer.  In order to fix this, we checked the filename size
-and only accepted filename lengths less than our equal to what we have capacity
+and only accepted filename lengths less than or equal to what we have capacity
 for, before reading the filename into our buffer.
 
 # EXERCISE 2B: What other robustness problems did you fix?  (~1-3 sentences
@@ -51,7 +51,7 @@ specified by the option.
 Another robustness problem we fixed involved potentially running out of memory
 or disk space.  To address this, we set a fixed download size limit.  If our
 peer downloads a file passed this limit, then we stop downloading and try again
-from anothe peer.
+from another peer.
 
 Another robustness problem that was fixed involved running out file descriptors
 when they weren't actually being used.  We set a timeout for our connections so
