@@ -25,10 +25,13 @@
 #include "osp2p.h"
 
 int evil_mode;			// nonzero iff this peer should behave badly
-
+int num_open_upload_connections = 0; //How many peers are connected to us?
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
+
 pthread_mutex_t tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  condition_var = PTHREAD_COND_INITIALIZER;
 
 
 /*****************************************************************************
@@ -39,6 +42,7 @@ pthread_mutex_t tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define TASKBUFSIZ	10000 	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+#define MAXCONNECTIONS   0
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -639,6 +643,16 @@ static task_t *task_listen(task_t *listen_task)
 	task_t *t;
 	assert(listen_task->type == TASK_PEER_LISTEN);
 
+        //Grab mutex for number of open connections
+        pthread_mutex_lock(&connection_mutex);
+
+        if(num_open_upload_connections >= MAXCONNECTIONS) {
+            //Too many open connections at the moment. Block until connections open up
+            pthread_cond_wait( &condition_var, &connection_mutex );
+            pthread_mutex_unlock(&connection_mutex);
+        } else
+            pthread_mutex_unlock(&connection_mutex);
+
 	fd = accept(listen_task->peer_fd,
 		    (struct sockaddr *) &peer_addr, &peer_addrlen);
 	if (fd == -1 && (errno == EINTR || errno == EAGAIN
@@ -649,7 +663,10 @@ static task_t *task_listen(task_t *listen_task)
 
 	message("* Got connection from %s:%d\n",
 		inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
-            
+
+        pthread_mutex_lock(&connection_mutex);
+        num_open_upload_connections++;
+        pthread_mutex_unlock(&connection_mutex);    
 
 	t = task_new(TASK_UPLOAD);
 	t->peer_fd = fd;
@@ -746,6 +763,12 @@ void* process_downloads(void *arg) {
 // A thread representing some upload request will execute here
 void* process_uploads(void *arg) {
     task_upload( (task_t *)arg );
+
+    pthread_mutex_lock(&connection_mutex);
+    num_open_upload_connections--;
+    pthread_mutex_unlock(&connection_mutex);
+    
+    pthread_cond_signal( &condition_var );
     pthread_exit(NULL);
 }
 
