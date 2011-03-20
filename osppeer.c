@@ -24,7 +24,6 @@
 #include "osp2p.h"
 
 int evil_mode;			// nonzero iff this peer should behave badly
-int detect_large_file;
 
 static struct in_addr listen_addr;	// Define listening endpoint
 static int listen_port;
@@ -36,9 +35,8 @@ static int listen_port;
  * a bounded buffer that simplifies reading from and writing to peers.
  */
 
-#define TASKBUFSIZ	4096	// Size of task_t::buf
+#define TASKBUFSIZ	10000	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
-#define FILESIZ         1024*1024*1024    // Size of downloaded file
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -192,26 +190,13 @@ taskbufresult_t write_from_taskbuf(int fd, task_t *t)
 	unsigned headpos = (t->head % TASKBUFSIZ);
 	unsigned tailpos = (t->tail % TASKBUFSIZ);
 	ssize_t amt;
-	
 
 	if (t->head == t->tail)
 		return TBUF_END;
-	else if (headpos < tailpos) {
-		// Check if the file we are downloading is bigger than FILESIZ.
-		if(t->total_written + tailpos - headpos > FILESIZ) {
-			detect_large_file = 1;
-			return TBUF_ERROR;
-		}
+	else if (headpos < tailpos)
 		amt = write(fd, &t->buf[headpos], tailpos - headpos);
-	}
-	else {
-		// Check if the file we are downloading is bigger than FILESIZ.
-		if(t->total_written + TASKBUFSIZ - headpos > FILESIZ) {
-			detect_large_file = 1;
-			return TBUF_ERROR;
-		}
+	else
 		amt = write(fd, &t->buf[headpos], TASKBUFSIZ - headpos);
-	}
 
 	if (amt == -1 && (errno == EINTR || errno == EAGAIN
 			  || errno == EWOULDBLOCK))
@@ -581,18 +566,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 
 		ret = write_from_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
-		
-			// Check if the file sent is too large by
-			// seeing if current t->total_written + amt 
-			// to be written > FILESIZ.
-
-			if(detect_large_file) {
-				// Reset value for next write.
-				detect_large_file = 0;
-				error("* File was too large");
-			}
-			else
-				error("* Disk write error");
+			error("* Disk write error");
 			goto try_again;
 		}
 	}
@@ -670,21 +644,21 @@ static void task_upload(task_t *t)
 
 	assert(t->head == 0);
 
-	// In order to ensure that peers don't serve files outside the current directory,
-	// we will exit if the filename happens to be a path and not an actual filename.
+ 	// In order to ensure that peers don't serve files outside the current directory,
+        // we will exit if the filename happens to be a path and not an actual filename.
 
-	char *file = t->filename;
-	while(*file) {
+        char *file = t->filename;
+        while(*file) {
 
-		// Check to see if the current character pointed to by file is 
-		// is a slash or not.  
-		if(*file == '/') {
-			error("* Avoided security attack by not switching to dir: %s \n", t->filename);
-			goto exit;
-		}
-		file++;
-	}
-	
+                // Check to see if the current character pointed to by file is 
+                // is a slash or not.  
+                if(*file == '/') {
+                        error("* Avoided security attack by not switching to dir: %s \n", t->filename);
+                        goto exit;
+                }
+                file++;
+        }
+
 	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
 		error("* Odd request %.*s\n", t->tail, t->buf);
 		goto exit;
@@ -732,7 +706,6 @@ int main(int argc, char *argv[])
 	char *s;
 	const char *myalias;
 	struct passwd *pwent;
-	detect_large_file = 0;
 
 	// Default tracker is read.cs.ucla.edu
 	osp2p_sscanf("131.179.80.139:11111", "%I:%d",
