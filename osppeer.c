@@ -37,6 +37,7 @@ static int listen_port;
 
 #define TASKBUFSIZ	10000	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+#define FILESIZ         52428800 // Maximum file size allowed for download (equiv to 50 MB).
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -563,6 +564,12 @@ static void task_download(task_t *t, task_t *tracker_task)
 		} else if (ret == TBUF_END && t->head == t->tail)
 			/* End of file */
 			break;
+	
+		// Check if the file being downloaded is too large.
+		if(t->total_written + ret > FILESIZ) {
+			error("* File being downloaded is too large");
+			goto try_again;
+		}
 
 		ret = write_from_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -649,29 +656,40 @@ static void task_upload(task_t *t)
         // us to prevent a buffer overflow attack.
 
         char *temp_buf = t->buf;
-        int filename_start = 0;
+        int filename_size = 0;
 
-        // This while loop figures out where the start of the filename string
-        // begins.
-        while(1) {
-                if(!temp_buf)
-                        break;
-                else if(*temp_buf == ' ') {
-                        filename_start++;
-                        break;
-                }
-                else {
-                        filename_start++;
-                        temp_buf++;
-                }
-        }
+	// Here, we count the filename size to be the number of characters starting after "GET "
+	// up until another space.  If this size is greater than FILENAMESIZ, then we have an
+	// attempted buffer overflow attack.  
+	if(temp_buf[0] && temp_buf[0] == 'G' && temp_buf[1] 
+	&& temp_buf[1] == 'E' && temp_buf[2] && temp_buf[2] == 'T' 
+	&& temp_buf[3] && isspace(temp_buf[3]))
+	{
+		// Have the buf pointer point to the char after "GET ".
+		temp_buf += 4;
 
-        // Check the length of the file name passed.
+		// Loop through and check if the number of chars up until a space
+		// is less than what we can store in our filename buffer.
+	        while(1) {
 
-        if(t->tail - filename_start > FILENAMESIZ) {
-                error("* Buffer overflow prevented.\n");
-                goto exit;
-        }
+			// If we see a space then we're fine.
+                	if(*temp_buf == ' ')
+                        	break;
+			
+			// At this point, we know that our filename buffer
+			// cannot fit this filename, so we print an error and exit.
+			else if(filename_size > FILENAMESIZ) {
+				error("* Buffer overflow prevented.\n");
+				goto exit;
+			}
+			
+			// Otherwise, we increment the size count and char pointer.
+                	else {
+                       	 	filename_size++;
+                        	temp_buf++;
+                	}
+        	}
+	}
 
 	if(osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
                 error("* Odd request %.*s\n", t->tail, t->buf);
@@ -682,18 +700,27 @@ static void task_upload(task_t *t)
         // we will exit if the filename happens to be a path and not an actual filename.
         
         char *file = t->filename;
+	int cnt = 0;
+
+	// We iteratively check each character in the filename string to see
+	// if there is a forward slash char present.
         while(1) {
-                // Check to see if the current character pointed to by file is 
-                // is a slash or not.  
         
-                if(!file)
+		// We only need to look at a count of filename_size characters.
+                if(cnt > filename_size)
                         break;
+		
+		// If we see a forwad slash char, we print an error and exit immediately.
                 else if(*file == '/') {
                         error("* Avoided security attack by not switching to dir: %s \n", t->filename);
                         goto exit;
                 }
-                else
+
+		// Otherwise, we increment our count and filename pointer.
+                else {
+			cnt++;
                         file++;
+		}
         }
 
 	t->head = t->tail = 0;
