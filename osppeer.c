@@ -44,7 +44,7 @@ pthread_cond_t  cond_connect = PTHREAD_COND_INITIALIZER;
 #define TASKBUFSIZ	10000 	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
 #define MAXCONNECTIONS  20
-#define TIMEOUT         35      // Seconds until a connection times out
+#define TIMEOUT         1      // Seconds until a connection times out
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -87,6 +87,10 @@ typedef struct download_list {
     task_t *download;       // Download request
     task_t *tracker;        // Tracker task
     pthread_t *d_thread;    // Pointer to thread obj to be associated with this request
+    pthread_t *police_thread;
+    pthread_cond_t *timeout_cond;
+    pthread_mutex_t *mutex;
+    int alive;
     struct download_list *next;
 } download_list_t;
 
@@ -538,7 +542,10 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 //	directory.  't' was created by start_download().
 //	Starts with the first peer on 't's peer list, then tries all peers
 //	until a download is successful.
-static void task_download(task_t *t, task_t *tracker_task)
+
+
+//Return 1 on success, 0 if we need to try again, and -1 if no more peers to query
+static int task_download(task_t *t, task_t *tracker_task)
 {
 	int i, ret = -1;
 	assert((!t || t->type == TASK_DOWNLOAD)
@@ -548,7 +555,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 	if (!t || !t->peer_list) {
 		error("* No peers are willing to serve '%s'\n",
 		      (t ? t->filename : "that file"));
-		return;
+		return -1;
 	} else if (t->peer_list->addr.s_addr == listen_addr.s_addr
 		   && t->peer_list->port == listen_port)
 		goto try_again;
@@ -586,7 +593,7 @@ static void task_download(task_t *t, task_t *tracker_task)
 	if (t->disk_fd == -1) {
 		error("* Too many local files like '%s' exist already.\n\
 * Try 'rm %s.~*~' to remove them.\n", t->filename, t->filename);
-		return;
+		return -1;
 	}
 
 	// Read the file into the task buffer from the peer,
@@ -627,16 +634,12 @@ static void task_download(task_t *t, task_t *tracker_task)
                 //Release the mutex
                 pthread_mutex_unlock(&tracker_mutex);
 
-		return;
+		return 1;
 	}
 	error("* Download was empty, trying next peer\n");
 
     try_again:
-	if (t->disk_filename[0])
-		unlink(t->disk_filename);
-	// recursive call
-	task_pop_peer(t);
-	task_download(t, tracker_task);
+        return 0;
 }
 
 
@@ -764,10 +767,29 @@ static void task_upload(task_t *t)
 // A thread representing some download request will execute here
 void* process_downloads(void *arg) {
     download_list_t *download_entry = (download_list_t *) arg;
-    task_download(download_entry->download,download_entry->tracker);
+    int ret = 0;
+    while(1) {
+        ret = task_download(download_entry->download,download_entry->tracker);
+        pthread_mutex_lock(download_entry->mutex);
+        if(ret == 0) { 
+            if (download_entry->download->disk_filename[0])
+	 	unlink(download_entry->download->disk_filename);
+	    task_pop_peer(download_entry->download);
+            pthread_mutex_unlock(download_entry->mutex);
+        }
+        if(ret == 1 || ret == -1) {
+            pthread_mutex_unlock(download_entry->mutex);
+            break;
+        }
+    }
+        
+    pthread_mutex_lock(download_entry->mutex);
 
+    task_free( download_entry->download );
+    download_entry->alive = 0;
+    pthread_cond_signal(download_entry->timeout_cond);
 
-   //task_free()
+    pthread_mutex_unlock(download_entry->mutex);
 
     pthread_exit(NULL);
 }
@@ -895,7 +917,7 @@ void* timeout_police_upload(void *arg) {
 //thread will just kill the thread for taking too long to finish. It will then start another
 //thread to see if some other peer might be able to serve the file without timing out
 void* timeout_police_download(void *arg) {
-    upload_thread_args_t *var = (upload_thread_args_t *) arg;
+    download_list_t *var = (download_list_t *) arg;
     int ret;
     struct timeval now;
     struct timespec timeout;
@@ -909,26 +931,27 @@ void* timeout_police_download(void *arg) {
     if(var->alive) {
         ret = pthread_cond_timedwait(var->timeout_cond, var->mutex, &timeout);
         if( ret == ETIMEDOUT ) { 
-            error("* An upload request to us timed out\n");
+            error("* A download request from us timed out\n");
             //The thread we are watching has overstayed its welcome.
             //It is time for it to die
-            pthread_cancel(*(var->u_thread));
-            task_free(var->u_task);
+ 
+            //acquire this to make sure thread you are about to kill does not die holding mutex
+            pthread_mutex_lock(&tracker_mutex);
+            pthread_cancel(*(var->d_thread));
+            pthread_mutex_unlock(&tracker_mutex);
+            
+            task_free(var->download);
         }  //Else, thread exited on time. So do nothing
     } 
     
     pthread_mutex_unlock(var->mutex);
 
     //Cleanup code
-    free(var->u_thread);
     free(var->timeout_cond);
     free(var->mutex);
-    free(var);
 
     pthread_exit(NULL);
 }
-
-
 
 
 // main(argc, argv)
@@ -1024,6 +1047,13 @@ int main(int argc, char *argv[])
                 d_list->download = start_download(tracker_task,argv[1]);
                 d_list->tracker = tracker_task;
                 d_list->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                d_list->police_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                d_list->timeout_cond = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
+                d_list->mutex = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t));
+                d_list->alive = 1;
+                pthread_mutex_init(d_list->mutex,NULL);
+                pthread_cond_init(d_list->timeout_cond,NULL);
+
                 d_list->next = NULL;
                 current_d = d_list;
             } else {
@@ -1033,6 +1063,14 @@ int main(int argc, char *argv[])
                 current_d->download = start_download(tracker_task,argv[1]);
                 current_d->tracker = tracker_task;
                 current_d->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                current_d->d_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                current_d->police_thread = (pthread_t *) malloc(sizeof(pthread_t));
+                current_d->timeout_cond = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
+                current_d->mutex = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t));
+                current_d->alive = 1;
+
+                pthread_mutex_init(current_d->mutex,NULL);
+                pthread_cond_init(current_d->timeout_cond,NULL);
                 current_d->next = NULL;
             }
         }
@@ -1042,6 +1080,8 @@ int main(int argc, char *argv[])
 
         while(current_d != NULL) {
             pthread_create( current_d->d_thread, NULL, process_downloads, (void*) current_d );
+            //Launch officer thread as well
+            pthread_create( current_d->police_thread, NULL, timeout_police_download, (void*) current_d);
             current_d = current_d->next;
         }
 
@@ -1052,9 +1092,11 @@ int main(int argc, char *argv[])
        
         while(current_d != NULL) {
             pthread_join(*current_d->d_thread, NULL);
+            pthread_join(*current_d->police_thread, NULL); //Has officer thread exited?
             ptr = current_d;
             current_d = current_d->next;
             free(ptr->d_thread);
+            free(ptr->police_thread);
             free(ptr);
         }
 
