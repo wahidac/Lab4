@@ -215,9 +215,6 @@ taskbufresult_t read_to_taskbuf(int fd, task_t *t)
 		return TBUF_OK;
 	}
 
-        //FIX: bug here? what if tail wraps around? this just keeps increasing tail
-        //If too big, data will wrap around and overwrite data!!! probably more of a
-        //problem in caller than this actual function.
 
 }
 
@@ -323,9 +320,6 @@ int open_socket(struct in_addr addr, int port)
 //	data portion.  It also terminates this client if the tracker's response
 //	is formatted badly.  (This code trusts the tracker.)
 
-//FIX: this is a security vulnerability. A bad tracker can screw this system over
-//with a badly formatted response
-//FIX: if t->tail is too large, we will have buffer overflow!!!!we should check for this case
 static size_t read_tracker_response(task_t *t)
 {
 	char *s;
@@ -628,7 +622,6 @@ static int task_download(task_t *t, task_t *tracker_task)
 			t->disk_filename, (unsigned long) t->total_written);
 		// Inform the tracker that we now have the file,
 		// and can serve it to others!  (But ignore tracker errors.)
-                //FIX: tracker errors are ignored. Probably not a good idea!
 
                 //Acquire mutex in order to write into tracker's buffer
                 pthread_mutex_lock(&tracker_mutex);
