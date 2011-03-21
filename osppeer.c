@@ -21,6 +21,7 @@
 #include <time.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include "md5.h"
 #include "osp2p.h"
 
@@ -31,7 +32,7 @@ static int listen_port;
 
 pthread_mutex_t tracker_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t connection_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  condition_var = PTHREAD_COND_INITIALIZER;
+pthread_cond_t  cond_connect = PTHREAD_COND_INITIALIZER;
 
 
 /*****************************************************************************
@@ -42,7 +43,8 @@ pthread_cond_t  condition_var = PTHREAD_COND_INITIALIZER;
 
 #define TASKBUFSIZ	10000 	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
-#define MAXCONNECTIONS   20
+#define MAXCONNECTIONS  20
+#define TIMEOUT         35      // Seconds until a connection times out
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -89,6 +91,15 @@ typedef struct download_list {
 } download_list_t;
 
 
+//Need following struct to get around restriction that only allows us to pass in one argument
+//to a thread. 
+typedef struct upload_thread_args {
+    pthread_t *u_thread;   //Pointer to p_thread the timeout_police is responsible for
+    pthread_cond_t *timeout_cond;
+    pthread_mutex_t *mutex; //Mutex for the condition timeout
+    int alive;              //Is the thread the officer is responsible alive?
+    task_t *u_task;         //Pointer to task associated with this thread
+} upload_thread_args_t;
 
 // task_new(type)
 //	Create and return a new task of type 'type'.
@@ -537,7 +548,6 @@ static void task_download(task_t *t, task_t *tracker_task)
 	if (!t || !t->peer_list) {
 		error("* No peers are willing to serve '%s'\n",
 		      (t ? t->filename : "that file"));
-		task_free(t);
 		return;
 	} else if (t->peer_list->addr.s_addr == listen_addr.s_addr
 		   && t->peer_list->port == listen_port)
@@ -576,7 +586,6 @@ static void task_download(task_t *t, task_t *tracker_task)
 	if (t->disk_fd == -1) {
 		error("* Too many local files like '%s' exist already.\n\
 * Try 'rm %s.~*~' to remove them.\n", t->filename, t->filename);
-		task_free(t);
 		return;
 	}
 
@@ -618,7 +627,6 @@ static void task_download(task_t *t, task_t *tracker_task)
                 //Release the mutex
                 pthread_mutex_unlock(&tracker_mutex);
 
-		task_free(t);
 		return;
 	}
 	error("* Download was empty, trying next peer\n");
@@ -648,7 +656,7 @@ static task_t *task_listen(task_t *listen_task)
 
         if(num_open_upload_connections >= MAXCONNECTIONS) {
             //Too many open connections at the moment. Block until connections open up
-            pthread_cond_wait( &condition_var, &connection_mutex );
+            pthread_cond_wait( &cond_connect, &connection_mutex );
             pthread_mutex_unlock(&connection_mutex);
         } else
             pthread_mutex_unlock(&connection_mutex);
@@ -750,25 +758,42 @@ static void task_upload(task_t *t)
 	message("* Upload of %s complete\n", t->filename);
 
     exit:
-	task_free(t);
+        return;
 }
 
 // A thread representing some download request will execute here
 void* process_downloads(void *arg) {
     download_list_t *download_entry = (download_list_t *) arg;
     task_download(download_entry->download,download_entry->tracker);
+
+
+   //task_free()
+
     pthread_exit(NULL);
 }
 
 // A thread representing some upload request will execute here
 void* process_uploads(void *arg) {
-    task_upload( (task_t *)arg );
+    upload_thread_args_t *var = (upload_thread_args_t *) arg;
+    task_upload( var->u_task );
+
+    pthread_mutex_lock(var->mutex);
+
+    task_free( var->u_task );
 
     pthread_mutex_lock(&connection_mutex);
     num_open_upload_connections--;
     pthread_mutex_unlock(&connection_mutex);
-    
-    pthread_cond_signal( &condition_var );
+
+    //Signal parent thread that connection freed up
+    pthread_cond_signal( &cond_connect );
+
+    //Signal to corresponding officer thread that we're done
+    var->alive = 0;
+    pthread_cond_signal( var->timeout_cond );
+
+    pthread_mutex_unlock(var->mutex);
+
     pthread_exit(NULL);
 }
 
@@ -822,6 +847,89 @@ void hunt_for_victims(task_t *tracker_task) {
      }
 
 }
+
+
+
+//a timeout_police_upload thread will run alongside each upload request and monitor how long
+//the upload is taking. If the thread finishes before the timeout (35 seconds), it will signal
+//the timeout_police thread letting it know and this thread will exit. Else, the timeout_police
+//thread will just kill the thread for taking too long to finish. This is to prevent DOS attacks
+void* timeout_police_upload(void *arg) {
+    upload_thread_args_t *var = (upload_thread_args_t *) arg;
+    int ret;
+    struct timeval now;
+    struct timespec timeout;
+    gettimeofday(&now,NULL);
+    timeout.tv_sec = now.tv_sec + TIMEOUT;
+    timeout.tv_nsec = now.tv_usec * 1000;
+
+    //Begin waiting on
+    pthread_mutex_lock(var->mutex);
+
+    if(var->alive) {
+        ret = pthread_cond_timedwait(var->timeout_cond, var->mutex, &timeout);
+        if( ret == ETIMEDOUT ) { 
+            error("* An upload request to us timed out\n");
+            //The thread we are watching has overstayed its welcome.
+            //It is time for it to die
+            pthread_cancel(*(var->u_thread));
+            task_free(var->u_task);
+        }  //Else, thread exited on time. So do nothing
+    } 
+    
+    pthread_mutex_unlock(var->mutex);
+
+    //Cleanup code
+    free(var->u_thread);
+    free(var->timeout_cond);
+    free(var->mutex);
+    free(var);
+
+    pthread_exit(NULL);
+}
+
+
+//a timeout_police_download thread will run alongside each download request and monitor how long
+//the download is taking. If the thread finishes before the timeout (35 seconds), it will signal
+//the timeout_police thread letting it know and this thread will exit. Else, the timeout_police
+//thread will just kill the thread for taking too long to finish. It will then start another
+//thread to see if some other peer might be able to serve the file without timing out
+void* timeout_police_download(void *arg) {
+    upload_thread_args_t *var = (upload_thread_args_t *) arg;
+    int ret;
+    struct timeval now;
+    struct timespec timeout;
+    gettimeofday(&now,NULL);
+    timeout.tv_sec = now.tv_sec + TIMEOUT;
+    timeout.tv_nsec = now.tv_usec * 1000;
+
+    //Begin waiting on
+    pthread_mutex_lock(var->mutex);
+
+    if(var->alive) {
+        ret = pthread_cond_timedwait(var->timeout_cond, var->mutex, &timeout);
+        if( ret == ETIMEDOUT ) { 
+            error("* An upload request to us timed out\n");
+            //The thread we are watching has overstayed its welcome.
+            //It is time for it to die
+            pthread_cancel(*(var->u_thread));
+            task_free(var->u_task);
+        }  //Else, thread exited on time. So do nothing
+    } 
+    
+    pthread_mutex_unlock(var->mutex);
+
+    //Cleanup code
+    free(var->u_thread);
+    free(var->timeout_cond);
+    free(var->mutex);
+    free(var);
+
+    pthread_exit(NULL);
+}
+
+
+
 
 // main(argc, argv)
 //	The main loop!
@@ -955,8 +1063,22 @@ int main(int argc, char *argv[])
 
         //Generate a new thread for each upload request
 	while ((t = task_listen(listen_task))) {
-            pthread_t u_thread;
-            pthread_create( &u_thread, NULL, process_uploads, (void*) t );
+            upload_thread_args_t *args = 
+                (upload_thread_args_t*) malloc(sizeof(upload_thread_args_t));
+            args->u_thread = (pthread_t *) malloc(sizeof(pthread_t));
+            args->timeout_cond = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
+            args->mutex = (pthread_mutex_t*) malloc(sizeof(pthread_mutex_t));
+            args->alive = 1;
+            args->u_task = t;
+            pthread_mutex_init(args->mutex,NULL);
+            pthread_cond_init(args->timeout_cond,NULL);
+           
+            //Create the upload thread 
+            pthread_create( args->u_thread, NULL, process_uploads, (void*) args );
+
+            //Create the officer thread
+            pthread_t officer;
+            pthread_create( &officer, NULL, timeout_police_upload, (void*) args );
         } 
 
 	return 0;
